@@ -22,21 +22,24 @@ public class ChatbotController {
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpClient http = HttpClient.newHttpClient();
 
-    private static final Pattern EMAIL_RX = Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
-    private static final Pattern NAME_RX  = Pattern.compile("^[A-Za-z][A-Za-z\\s.'-]{1,60}$");
-    private static final Pattern PHONE_RX = Pattern.compile("^\\+?[0-9]{10,15}$");
+    private static final Pattern EMAIL_RX     = Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
+    private static final Pattern NAME_RX      = Pattern.compile("^[A-Za-z][A-Za-z\\s.'-]{1,60}$");
+    private static final Pattern GIBBERISH_RX = Pattern.compile("(?i).*[bcdfghjklmnpqrstvwxyz]{6,}.*");
+    private static final Pattern PHONE_RX     = Pattern.compile("^\\+?[0-9]{10,15}$");
+	
+  	@Value("${NVIDIA_MAX_TOKENS:}")
+        private int maxChatTokens;	
 
     @Value("${NVIDIA_API_KEY:}")
     private String nvidiaKey;
 
-    // Render Environment Variable se model select hoga!
-    @Value("${NVIDIA_MODEL:nvidia/llama-3.3-nemotron-super-49b-v1.5}")
+    @Value("${NVIDIA_MODEL:}")
     private String nvidiaModel;
 
     @Value("${RESEND_API_KEY:}")
     private String resendKey;
 
-    @Value("${NOTIFY_EMAIL:shivamtiwaryniet@gmail.com}")
+    @Value("${NOTIFY_EMAIL:}")
     private String notifyEmail;
 
     public ChatbotController(JdbcTemplate jdbc) {
@@ -46,6 +49,20 @@ public class ChatbotController {
     @GetMapping("/health")
     public Map<String, String> health() {
         return Map.of("status", "ok", "model", nvidiaModel);
+    }
+
+    // Browser me kholkar AI test karne ke liye: /api/test-ai
+    @GetMapping("/test-ai")
+    public Map<String, Object> testAi() {
+        if (nvidiaKey == null || nvidiaKey.isEmpty()) {
+            return Map.of("ok", false, "error", "NVIDIA_API_KEY is missing in Render Environment!");
+        }
+        String reply = callNemotron("/no_think\nYou are a helpful assistant.", "Say 'AI is working!' in 4 words.", 100, 0.2);
+        return Map.of(
+            "ok", reply != null && !reply.isEmpty(),
+            "model", nvidiaModel,
+            "reply", reply == null ? "FAILED - Check Render Logs for HTTP status" : reply
+        );
     }
 
     // 1. Verify Input (Regex + TiDB Duplicate Check + AI Model Verification)
@@ -61,7 +78,6 @@ public class ChatbotController {
                     return Map.of("valid", false, "message",
                         "That does not look like a valid email address. Please enter a real email (e.g., john@example.com).");
                 }
-                // Check TiDB duplicate first
                 List<Map<String, Object>> rows = jdbc.queryForList(
                     "SELECT full_name FROM visitors WHERE email = ? LIMIT 1", email
                 );
@@ -74,7 +90,6 @@ public class ChatbotController {
                         "message", "Welcome back, " + oldName + "! Great to see you again. How can I assist you today?"
                     );
                 }
-                // AI model check for fake/gibberish emails
                 String aiCheck = verifyWithAI("email", email);
                 if (aiCheck != null) {
                     return Map.of("valid", false, "message", aiCheck);
@@ -83,9 +98,9 @@ public class ChatbotController {
             }
 
             case "name": {
-                if (!NAME_RX.matcher(value).matches() || value.trim().length() < 2) {
+                if (!NAME_RX.matcher(value).matches() || value.trim().length() < 2 || GIBBERISH_RX.matcher(value).matches()) {
                     return Map.of("valid", false, "message",
-                        "Please enter a valid full name using letters only (e.g., Rahul Sharma).");
+                        "That doesn't look like a real name. Please enter your actual full name (e.g., Rahul Sharma).");
                 }
                 String aiCheck = verifyWithAI("name", value);
                 if (aiCheck != null) {
@@ -119,9 +134,9 @@ public class ChatbotController {
             }
 
             case "work": {
-                if (value.length() < 4) {
+                if (value.length() < 4 || GIBBERISH_RX.matcher(value).matches()) {
                     return Map.of("valid", false, "message",
-                        "Please share a few more details about your project, job inquiry, or purpose.");
+                        "Please briefly describe your project, job inquiry, or why you are contacting Shivam.");
                 }
                 String aiCheck = verifyWithAI("work", value);
                 if (aiCheck != null) {
@@ -172,47 +187,71 @@ public class ChatbotController {
         return Map.of("returning", false, "name", name, "saved", true);
     }
 
-    // 3. Full English AI Chat (After Verification)
+   // 3. Full English AI Chat (With Detailed Context + History + Increased Tokens)
     @PostMapping("/chat")
-    public Map<String, String> chat(@RequestBody Map<String, String> body) {
-        String msg = clean(body.get("message"));
-        String visitorName = clean(body.get("visitorName"));
-        String work = clean(body.get("work"));
+    public Map<String, String> chat(@RequestBody Map<String, Object> body) {
+        String msg = str(body.get("message"));
+        String visitorName = str(body.get("visitorName"));
+        String work = str(body.get("work"));
 
         String systemPrompt =
-            "You are Shivam Tiwary's official portfolio AI assistant. Always reply in clear, polite, professional English. " +
-            "Shivam Tiwary is an MCA student (NIET, Greater Noida, 8.24 CGPA) and Full Stack Developer skilled in Core Java, JDBC, Spring Boot, Python, C, HTML/CSS, JavaScript, and MySQL. " +
-            "The verified visitor's name is " + (visitorName.isEmpty() ? "Guest" : visitorName) +
-            (work.isEmpty() ? "" : " and their stated purpose is: " + work) + ". " +
-            "Answer concisely in 2-4 sentences.";
+            "/no_think\n" +
+            "You are Shivam Tiwary's official portfolio AI assistant. Always reply in clear, polite, professional English.\n" +
+            "--- ABOUT SHIVAM TIWARY ---\n" +
+            "Role: Full Stack Developer & MCA Student.\n" +
+            "Education: Pursuing Master of Computer Applications (MCA, 2025-2027) at NIET, Greater Noida (AKTU) with 8.24/10 CGPA in Semester I. Completed B.Sc. Mathematics (2022-2025) from Shershah College, Sasaram (VKSU) with 67.6%.\n" +
+            "Technical Skills: Core Java, JDBC, Spring Boot, Python, C Programming, HTML5, CSS3, JavaScript, MySQL, TiDB Cloud, Git, GitHub, Linux/Bash.\n" +
+            "CS Fundamentals & Tools: OOP, Data Structures & Algorithms (DSA), DBMS, Operating Systems, VS Code, IntelliJ IDEA.\n" +
+            "Contact Email: shivamtiwaryniet@gmail.com.\n" +
+            "--- CURRENT VISITOR ---\n" +
+            "Name: " + (visitorName.isEmpty() ? "Guest" : visitorName) + "\n" +
+            (work.isEmpty() ? "" : "Stated Purpose: " + work + "\n") +
+            "Answer helpfully, accurately, and concisely (2-5 sentences unless asked for more details).";
 
-        String reply = callNemotron(systemPrompt, msg, 240, 0.5);
-        if (reply == null || reply.isEmpty()) {
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", systemPrompt));
+
+        Object rawHistory = body.get("history");
+        if (rawHistory instanceof List<?> list) {
+            int start = Math.max(0, list.size() - 10);
+            for (int i = start; i < list.size(); i++) {
+                if (list.get(i) instanceof Map<?, ?> item) {
+                    String role = str(item.get("role"));
+                    String content = str(item.get("content"));
+                    if (("user".equals(role) || "assistant".equals(role)) && !content.isEmpty()) {
+                        messages.add(Map.of("role", role, "content", content));
+                    }
+                }
+            }
+        }
+        messages.add(Map.of("role", "user", "content", msg));
+
+        String reply = callNemotronMessages(messages, maxChatTokens, 0.5);
+        if (reply == null || reply.isEmpty() || "null".equalsIgnoreCase(reply)) {
             reply = "Thank you for your message, " + (visitorName.isEmpty() ? "friend" : visitorName) +
                     "! Shivam will review your request and follow up via email shortly.";
         }
         return Map.of("reply", reply);
     }
 
-    // Helper: Uses NVIDIA Nemotron to verify genuine Name / Email / Work
     private String verifyWithAI(String field, String value) {
         if (nvidiaKey == null || nvidiaKey.isEmpty()) return null;
 
         String rule;
         if ("name".equals(field)) {
-            rule = "The user was asked for their Full Name. Decide if \"" + value + "\" is a plausible real person's name. " +
-                   "Reject greetings (hi, hello, hey), questions, random gibberish (asdf, xyz), or non-names (test, admin, nobody, ok).";
+            rule = "The user was asked for their Full Name. Decide if \"" + value + "\" is a real human name. " +
+                   "Reject greetings (hi, hello, hey), keyboard smash/gibberish (asdf, Johkjskjdkjf, qwert), test words (test, admin, nobody), or non-names.";
         } else if ("email".equals(field)) {
-            rule = "The user was asked for their Email Address. Decide if \"" + value + "\" looks like a genuine personal or work email (not obvious fake gibberish like asdf@asdf.com or fake@fake.com).";
+            rule = "The user was asked for their Email Address. Decide if \"" + value + "\" looks like a genuine personal or work email (reject obvious fake gibberish like asdf@asdf.com or fake@fake.com).";
         } else {
-            rule = "The user was asked for the Work / Project / Reason they are contacting Shivam Tiwary (a software developer). " +
-                   "Decide if \"" + value + "\" is a meaningful purpose or inquiry (reject random gibberish like 'asdfgh', 'hi', 'nothing', 'idk', '1234').";
+            rule = "The user was asked why they are contacting Shivam Tiwary (a software developer). " +
+                   "Decide if \"" + value + "\" is a meaningful project/job/contact reason (reject gibberish like 'asdfgh', 'hi', 'nothing', 'idk', '1234').";
         }
 
-        String sys = "You are a strict form input validator. " +
-            "Reply ONLY with the exact word VALID if the input passes, OR reply starting with INVALID: followed by a polite 1-sentence English message asking the user to enter a genuine " + field + ".";
+        String sys = "/no_think\nYou are a strict form validator. " +
+            "Reply ONLY with the single word VALID if it passes, OR reply starting with INVALID: followed by a polite 1-sentence English message asking for a genuine " + field + ".";
 
-        String aiRes = callNemotron(sys, rule, 80, 0.1);
+        String aiRes = callNemotron(sys, rule, 300, 0.1);
         if (aiRes != null && aiRes.toUpperCase().startsWith("INVALID:")) {
             return aiRes.substring(8).trim();
         }
@@ -220,14 +259,22 @@ public class ChatbotController {
     }
 
     private String callNemotron(String systemPrompt, String userPrompt, int maxTokens, double temp) {
+        return callNemotronMessages(
+            List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user", "content", userPrompt)
+            ),
+            maxTokens,
+            temp
+        );
+    }
+
+    private String callNemotronMessages(List<Map<String, String>> messages, int maxTokens, double temp) {
         if (nvidiaKey == null || nvidiaKey.isEmpty()) return null;
         try {
             Map<String, Object> payload = Map.of(
                 "model", nvidiaModel,
-                "messages", List.of(
-                    Map.of("role", "system", "content", systemPrompt),
-                    Map.of("role", "user", "content", userPrompt)
-                ),
+                "messages", messages,
                 "max_tokens", maxTokens,
                 "temperature", temp
             );
@@ -240,12 +287,20 @@ public class ChatbotController {
                 .build();
 
             HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
-            if (res.statusCode() >= 400) return null;
+            if (res.statusCode() >= 400) {
+                System.err.println("NVIDIA API Error " + res.statusCode() + ": " + res.body());
+                return null;
+            }
 
-            JsonNode root = mapper.readTree(res.body());
-            String content = root.path("choices").path(0).path("message").path("content").asText();
-            return content == null ? null : content.trim();
+            JsonNode msgNode = mapper.readTree(res.body()).path("choices").path(0).path("message");
+            JsonNode contentNode = msgNode.path("content");
+            if (contentNode.isMissingNode() || contentNode.isNull()) {
+                return null;
+            }
+            String content = contentNode.asText("").replaceAll("(?s)<think>.*?</think>", "").trim();
+            return (content.isEmpty() || "null".equalsIgnoreCase(content)) ? null : content;
         } catch (Exception e) {
+            System.err.println("NVIDIA Call Exception: " + e.getMessage());
             return null;
         }
     }
@@ -278,6 +333,7 @@ public class ChatbotController {
     }
 
     private String clean(String s) { return s == null ? "" : s.trim(); }
+    private String str(Object o) { return o == null ? "" : clean(String.valueOf(o)); }
     private String esc(String s) {
         return clean(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
