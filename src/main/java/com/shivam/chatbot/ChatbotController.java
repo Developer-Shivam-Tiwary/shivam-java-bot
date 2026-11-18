@@ -28,6 +28,9 @@ public class ChatbotController {
     private static final Pattern NAME_RX      = Pattern.compile("^[A-Za-z][A-Za-z\\s.'-]{1,60}$");
     private static final Pattern GIBBERISH_RX = Pattern.compile("(?i).*[bcdfghjklmnpqrstvwxyz]{6,}.*");
     private static final Pattern PHONE_RX     = Pattern.compile("^\\+?[0-9]{10,15}$");
+
+	@Value("${NVIDIA_MAX_TOKENS:}")
+    private int nvidiaMaxTokens;
 	
   	@Value("${NVIDIA_MAX_TOKENS:}")
         private int maxChatTokens;	
