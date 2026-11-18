@@ -6,6 +6,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
+import java.time.Duration;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -51,18 +53,58 @@ public class ChatbotController {
         return Map.of("status", "ok", "model", nvidiaModel);
     }
 
-    // Browser me kholkar AI test karne ke liye: /api/test-ai
+    // Diagnostic endpoint: browser me exact NVIDIA status aur raw reply dikhayega
     @GetMapping("/test-ai")
     public Map<String, Object> testAi() {
-        if (nvidiaKey == null || nvidiaKey.isEmpty()) {
-            return Map.of("ok", false, "error", "NVIDIA_API_KEY is missing in Render Environment!");
+        Map<String, Object> resMap = new LinkedHashMap<>();
+        resMap.put("model", nvidiaModel);
+        resMap.put("hasKey", nvidiaKey != null && !nvidiaKey.isBlank());
+        resMap.put("maxTokens", nvidiaMaxTokens);
+
+        if (nvidiaKey == null || nvidiaKey.isBlank()) {
+            resMap.put("ok", false);
+            resMap.put("error", "NVIDIA_API_KEY env variable is missing or empty in Render");
+            return resMap;
         }
-        String reply = callNemotron("/no_think\nYou are a helpful assistant.", "Say 'AI is working!' in 4 words.", 100, 0.2);
-        return Map.of(
-            "ok", reply != null && !reply.isEmpty(),
-            "model", nvidiaModel,
-            "reply", reply == null ? "FAILED - Check Render Logs for HTTP status" : reply
-        );
+
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("model", nvidiaModel);
+            payload.put("messages", List.of(
+                Map.of("role", "system", "content", "/no_think\nReply in clear English."),
+                Map.of("role", "user", "content", "Say hello in one short sentence.")
+            ));
+            payload.put("max_tokens", nvidiaMaxTokens);
+            payload.put("temperature", 0.3);
+            payload.put("chat_template_kwargs", Map.of("enable_thinking", false));
+
+            HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("https://integrate.api.nvidia.com/v1/chat/completions"))
+                .timeout(Duration.ofSeconds(30))
+                .header("Authorization", "Bearer " + nvidiaKey)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)))
+                .build();
+
+            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            resMap.put("statusCode", res.statusCode());
+            resMap.put("rawResponse", res.body());
+
+            if (res.statusCode() < 400) {
+                JsonNode contentNode = mapper.readTree(res.body())
+                    .path("choices").path(0).path("message").path("content");
+                String reply = contentNode.isNull() ? "" : contentNode.asText("")
+                    .replaceAll("(?s)<think>.*?</think>", "").trim();
+                resMap.put("ok", !reply.isEmpty());
+                resMap.put("reply", reply);
+            } else {
+                resMap.put("ok", false);
+            }
+        } catch (Exception e) {
+            resMap.put("ok", false);
+            resMap.put("exception", e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        return resMap;
     }
 
     // 1. Verify Input (Regex + TiDB Duplicate Check + AI Model Verification)
