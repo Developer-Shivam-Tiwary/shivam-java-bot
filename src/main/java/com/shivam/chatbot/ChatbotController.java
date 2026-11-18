@@ -11,18 +11,27 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.*;
+import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api")
-@CrossOrigin(origins = "*") // Live hone ke baad "*" ki jagah apna blogspot URL daal sakte hain
+@CrossOrigin(origins = "*")
 public class ChatbotController {
 
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpClient http = HttpClient.newHttpClient();
 
+    private static final Pattern EMAIL_RX = Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
+    private static final Pattern NAME_RX  = Pattern.compile("^[A-Za-z][A-Za-z\\s.'-]{1,60}$");
+    private static final Pattern PHONE_RX = Pattern.compile("^\\+?[0-9]{10,15}$");
+
     @Value("${NVIDIA_API_KEY:}")
     private String nvidiaKey;
+
+    // Render Environment Variable se model select hoga!
+    @Value("${NVIDIA_MODEL:nvidia/llama-3.3-nemotron-super-49b-v1.5}")
+    private String nvidiaModel;
 
     @Value("${RESEND_API_KEY:}")
     private String resendKey;
@@ -36,41 +45,102 @@ public class ChatbotController {
 
     @GetMapping("/health")
     public Map<String, String> health() {
-        return Map.of("status", "ok");
+        return Map.of("status", "ok", "model", nvidiaModel);
     }
 
-    // 1. Duplicate Email / Phone Check
-    @PostMapping("/check-visitor")
-    public Map<String, Object> checkVisitor(@RequestBody Map<String, String> body) {
-        String email = clean(body.get("email")).toLowerCase();
-        String phone = clean(body.get("phone")).replaceAll("\\s+", "");
+    // 1. Verify Input (Regex + TiDB Duplicate Check + AI Model Verification)
+    @PostMapping("/verify-input")
+    public Map<String, Object> verifyInput(@RequestBody Map<String, String> body) {
+        String field = clean(body.get("field")).toLowerCase();
+        String value = clean(body.get("value"));
 
-        if (email.isEmpty() && phone.isEmpty()) {
-            return Map.of("returning", false);
+        switch (field) {
+            case "email": {
+                String email = value.toLowerCase();
+                if (!EMAIL_RX.matcher(email).matches()) {
+                    return Map.of("valid", false, "message",
+                        "That does not look like a valid email address. Please enter a real email (e.g., john@example.com).");
+                }
+                // Check TiDB duplicate first
+                List<Map<String, Object>> rows = jdbc.queryForList(
+                    "SELECT full_name FROM visitors WHERE email = ? LIMIT 1", email
+                );
+                if (!rows.isEmpty()) {
+                    String oldName = String.valueOf(rows.get(0).get("full_name"));
+                    return Map.of(
+                        "valid", true,
+                        "returning", true,
+                        "name", oldName,
+                        "message", "Welcome back, " + oldName + "! Great to see you again. How can I assist you today?"
+                    );
+                }
+                // AI model check for fake/gibberish emails
+                String aiCheck = verifyWithAI("email", email);
+                if (aiCheck != null) {
+                    return Map.of("valid", false, "message", aiCheck);
+                }
+                return Map.of("valid", true, "returning", false);
+            }
+
+            case "name": {
+                if (!NAME_RX.matcher(value).matches() || value.trim().length() < 2) {
+                    return Map.of("valid", false, "message",
+                        "Please enter a valid full name using letters only (e.g., Rahul Sharma).");
+                }
+                String aiCheck = verifyWithAI("name", value);
+                if (aiCheck != null) {
+                    return Map.of("valid", false, "message", aiCheck);
+                }
+                return Map.of("valid", true);
+            }
+
+            case "phone": {
+                if (value.equalsIgnoreCase("skip")) {
+                    return Map.of("valid", true, "skipped", true, "returning", false);
+                }
+                String phone = value.replaceAll("[\\s()-]", "");
+                if (!PHONE_RX.matcher(phone).matches()) {
+                    return Map.of("valid", false, "message",
+                        "Please enter a valid 10 to 15 digit phone number, or type 'skip' to continue.");
+                }
+                List<Map<String, Object>> rows = jdbc.queryForList(
+                    "SELECT full_name FROM visitors WHERE phone = ? LIMIT 1", phone
+                );
+                if (!rows.isEmpty()) {
+                    String oldName = String.valueOf(rows.get(0).get("full_name"));
+                    return Map.of(
+                        "valid", true,
+                        "returning", true,
+                        "name", oldName,
+                        "message", "Welcome back, " + oldName + "! Your phone number is already registered. How can I help you today?"
+                    );
+                }
+                return Map.of("valid", true, "returning", false, "cleaned", phone);
+            }
+
+            case "work": {
+                if (value.length() < 4) {
+                    return Map.of("valid", false, "message",
+                        "Please share a few more details about your project, job inquiry, or purpose.");
+                }
+                String aiCheck = verifyWithAI("work", value);
+                if (aiCheck != null) {
+                    return Map.of("valid", false, "message", aiCheck);
+                }
+                return Map.of("valid", true);
+            }
+
+            default:
+                return Map.of("valid", true);
         }
-
-        List<Map<String, Object>> rows = jdbc.queryForList(
-            "SELECT full_name, work_details FROM visitors " +
-            "WHERE (? <> '' AND email = ?) OR (? <> '' AND phone = ?) LIMIT 1",
-            email, email, phone, phone
-        );
-
-        if (!rows.isEmpty()) {
-            return Map.of(
-                "returning", true,
-                "name", String.valueOf(rows.get(0).get("full_name")),
-                "lastWork", String.valueOf(rows.get(0).get("work_details"))
-            );
-        }
-        return Map.of("returning", false);
     }
 
-    // 2. TiDB MySQL me Save + Email Notification
+    // 2. Save Verified Visitor in TiDB + Send Email Alert
     @PostMapping("/save-visitor")
     public Map<String, Object> saveVisitor(@RequestBody Map<String, String> body) {
         String name = clean(body.get("name"));
         String email = clean(body.get("email")).toLowerCase();
-        String phone = clean(body.get("phone")).replaceAll("\\s+", "");
+        String phone = clean(body.get("phone")).replaceAll("[\\s()-]", "");
         String work = clean(body.get("work"));
 
         List<Map<String, Object>> existing = jdbc.queryForList(
@@ -102,28 +172,64 @@ public class ChatbotController {
         return Map.of("returning", false, "name", name, "saved", true);
     }
 
-    // 3. NVIDIA Nemotron AI Chat
+    // 3. Full English AI Chat (After Verification)
     @PostMapping("/chat")
     public Map<String, String> chat(@RequestBody Map<String, String> body) {
+        String msg = clean(body.get("message"));
+        String visitorName = clean(body.get("visitorName"));
+        String work = clean(body.get("work"));
+
+        String systemPrompt =
+            "You are Shivam Tiwary's official portfolio AI assistant. Always reply in clear, polite, professional English. " +
+            "Shivam Tiwary is an MCA student (NIET, Greater Noida, 8.24 CGPA) and Full Stack Developer skilled in Core Java, JDBC, Spring Boot, Python, C, HTML/CSS, JavaScript, and MySQL. " +
+            "The verified visitor's name is " + (visitorName.isEmpty() ? "Guest" : visitorName) +
+            (work.isEmpty() ? "" : " and their stated purpose is: " + work) + ". " +
+            "Answer concisely in 2-4 sentences.";
+
+        String reply = callNemotron(systemPrompt, msg, 240, 0.5);
+        if (reply == null || reply.isEmpty()) {
+            reply = "Thank you for your message, " + (visitorName.isEmpty() ? "friend" : visitorName) +
+                    "! Shivam will review your request and follow up via email shortly.";
+        }
+        return Map.of("reply", reply);
+    }
+
+    // Helper: Uses NVIDIA Nemotron to verify genuine Name / Email / Work
+    private String verifyWithAI(String field, String value) {
+        if (nvidiaKey == null || nvidiaKey.isEmpty()) return null;
+
+        String rule;
+        if ("name".equals(field)) {
+            rule = "The user was asked for their Full Name. Decide if \"" + value + "\" is a plausible real person's name. " +
+                   "Reject greetings (hi, hello, hey), questions, random gibberish (asdf, xyz), or non-names (test, admin, nobody, ok).";
+        } else if ("email".equals(field)) {
+            rule = "The user was asked for their Email Address. Decide if \"" + value + "\" looks like a genuine personal or work email (not obvious fake gibberish like asdf@asdf.com or fake@fake.com).";
+        } else {
+            rule = "The user was asked for the Work / Project / Reason they are contacting Shivam Tiwary (a software developer). " +
+                   "Decide if \"" + value + "\" is a meaningful purpose or inquiry (reject random gibberish like 'asdfgh', 'hi', 'nothing', 'idk', '1234').";
+        }
+
+        String sys = "You are a strict form input validator. " +
+            "Reply ONLY with the exact word VALID if the input passes, OR reply starting with INVALID: followed by a polite 1-sentence English message asking the user to enter a genuine " + field + ".";
+
+        String aiRes = callNemotron(sys, rule, 80, 0.1);
+        if (aiRes != null && aiRes.toUpperCase().startsWith("INVALID:")) {
+            return aiRes.substring(8).trim();
+        }
+        return null;
+    }
+
+    private String callNemotron(String systemPrompt, String userPrompt, int maxTokens, double temp) {
+        if (nvidiaKey == null || nvidiaKey.isEmpty()) return null;
         try {
-            String msg = clean(body.get("message"));
-            String visitorName = clean(body.get("visitorName"));
-
-            if (nvidiaKey.isEmpty()) {
-                return Map.of("reply", "Thanks " + visitorName + "! Shivam will review your message shortly.");
-            }
-
             Map<String, Object> payload = Map.of(
-                "model", "nvidia/llama-3.1-nemotron-70b-instruct",
+                "model", nvidiaModel,
                 "messages", List.of(
-                    Map.of("role", "system", "content",
-                        "You are Shivam Tiwary's friendly AI portfolio assistant. Shivam is an MCA student (NIET, 8.24 CGPA) and Full Stack Developer skilled in Core Java, JDBC, Python, C, HTML/CSS, JavaScript, and MySQL. Visitor's name is " +
-                        (visitorName.isEmpty() ? "Guest" : visitorName) +
-                        ". Answer in 2-4 crisp, helpful sentences."),
-                    Map.of("role", "user", "content", msg)
+                    Map.of("role", "system", "content", systemPrompt),
+                    Map.of("role", "user", "content", userPrompt)
                 ),
-                "max_tokens", 220,
-                "temperature", 0.5
+                "max_tokens", maxTokens,
+                "temperature", temp
             );
 
             HttpRequest req = HttpRequest.newBuilder()
@@ -134,31 +240,29 @@ public class ChatbotController {
                 .build();
 
             HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JsonNode root = mapper.readTree(res.body());
-            String reply = root.path("choices").path(0).path("message").path("content").asText();
+            if (res.statusCode() >= 400) return null;
 
-            if (reply == null || reply.isEmpty()) {
-                reply = "Thanks for reaching out! Shivam will connect with you soon.";
-            }
-            return Map.of("reply", reply.trim());
+            JsonNode root = mapper.readTree(res.body());
+            String content = root.path("choices").path(0).path("message").path("content").asText();
+            return content == null ? null : content.trim();
         } catch (Exception e) {
-            return Map.of("reply", "Got it! Shivam will get back to you soon via email.");
+            return null;
         }
     }
 
     private void sendEmailAlert(String name, String email, String phone, String work) {
         if (resendKey == null || resendKey.isEmpty()) return;
         try {
-            String html = "<h3>New Portfolio Chatbot Inquiry</h3>" +
+            String html = "<h3>New Verified Portfolio Inquiry</h3>" +
                 "<p><b>Name:</b> " + esc(name) + "</p>" +
                 "<p><b>Email:</b> " + esc(email) + "</p>" +
                 "<p><b>Phone:</b> " + esc(phone.isEmpty() ? "N/A" : phone) + "</p>" +
-                "<p><b>Work / Requirement:</b> " + esc(work) + "</p>";
+                "<p><b>Work / Purpose:</b> " + esc(work) + "</p>";
 
             Map<String, Object> mail = Map.of(
                 "from", "Portfolio Bot <onboarding@resend.dev>",
                 "to", List.of(notifyEmail),
-                "subject", "Portfolio Bot Lead: " + name,
+                "subject", "Verified Portfolio Lead: " + name,
                 "html", html
             );
 
